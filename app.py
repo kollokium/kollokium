@@ -96,21 +96,28 @@ def get_search_trend(keyword, start, end, serpapi_key):
         st.warning(f"검색량 추이 수집 실패: {e}")
         return pd.DataFrame()
 
-# ---------- (3) 두 파일 합치기 (댓글 날짜에 가장 가까운 검색량을 붙임) ----------
+# ---------- (3) 두 파일 합치기 (댓글 날짜에 가장 가까운 검색량, 숫자키로 안전하게) ----------
 def merge_files(df_comments, df_trend):
     if df_trend.empty:
         out = df_comments.copy()
         out["search_interest"] = pd.NA
         return out
     c = df_comments.copy()
-    c["_date"] = pd.to_datetime(c["comment_published_at"], utc=True, errors="coerce") \
-                   .dt.tz_localize(None).dt.normalize()
+    cd = pd.to_datetime(c["comment_published_at"], utc=True, errors="coerce") \
+           .dt.tz_localize(None).dt.normalize()
     t = df_trend.copy()
-    t["_date"] = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
-    t = t[["_date", "search_interest"]].dropna(subset=["_date"]).sort_values("_date")
-    c = c.dropna(subset=["_date"]).sort_values("_date")
-    merged = pd.merge_asof(c, t, on="_date", direction="nearest")
-    return merged.drop(columns="_date").sort_values("comment_published_at").reset_index(drop=True)
+    td = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
+    # 날짜를 정수(일련일)로 바꿔 dtype 문제를 원천 차단
+    c["_key"] = cd.map(lambda x: x.toordinal() if pd.notna(x) else pd.NA)
+    t["_key"] = td.map(lambda x: x.toordinal() if pd.notna(x) else pd.NA)
+    c = c.dropna(subset=["_key"]).copy()
+    t = t[["_key", "search_interest"]].dropna(subset=["_key"]).copy()
+    c["_key"] = c["_key"].astype(int)
+    t["_key"] = t["_key"].astype(int)
+    c = c.sort_values("_key")
+    t = t.sort_values("_key")
+    merged = pd.merge_asof(c, t, on="_key", direction="nearest")
+    return merged.drop(columns="_key").sort_values("comment_published_at").reset_index(drop=True)
 
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
