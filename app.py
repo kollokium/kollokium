@@ -1,4 +1,4 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일(날짜 기준) =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일(댓글없는 날짜 포함) =====
 import time
 import requests
 import pandas as pd
@@ -96,28 +96,30 @@ def get_search_trend(keyword, start, end, serpapi_key):
         st.warning(f"검색량 추이 수집 실패: {e}")
         return pd.DataFrame()
 
-# ---------- (3) 두 파일 합치기 (댓글 날짜에 가장 가까운 검색량, 숫자키로 안전하게) ----------
+# ---------- (3) 두 파일 합치기 (댓글 없는 검색 날짜도 포함) ----------
 def merge_files(df_comments, df_trend):
-    if df_trend.empty:
-        out = df_comments.copy()
-        out["search_interest"] = pd.NA
-        return out
     c = df_comments.copy()
-    cd = pd.to_datetime(c["comment_published_at"], utc=True, errors="coerce") \
-           .dt.tz_localize(None).dt.normalize()
+    c["date"] = pd.to_datetime(c["comment_published_at"], utc=True, errors="coerce") \
+                  .dt.tz_localize(None).dt.normalize()
+    if df_trend.empty:
+        c["search_interest"] = pd.NA
+        return c.sort_values("date").reset_index(drop=True)
     t = df_trend.copy()
-    td = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
-    # 날짜를 정수(일련일)로 바꿔 dtype 문제를 원천 차단
-    c["_key"] = cd.map(lambda x: x.toordinal() if pd.notna(x) else pd.NA)
-    t["_key"] = td.map(lambda x: x.toordinal() if pd.notna(x) else pd.NA)
-    c = c.dropna(subset=["_key"]).copy()
-    t = t[["_key", "search_interest"]].dropna(subset=["_key"]).copy()
-    c["_key"] = c["_key"].astype(int)
-    t["_key"] = t["_key"].astype(int)
-    c = c.sort_values("_key")
-    t = t.sort_values("_key")
-    merged = pd.merge_asof(c, t, on="_key", direction="nearest")
-    return merged.drop(columns="_key").sort_values("comment_published_at").reset_index(drop=True)
+    t["date"] = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
+    t = t.dropna(subset=["date"])
+    c2 = c.dropna(subset=["date"]).copy()
+    c2["_key"] = c2["date"].map(lambda x: x.toordinal())
+    t2 = t.copy()
+    t2["_key"] = t2["date"].map(lambda x: x.toordinal())
+    # 댓글 행 + 가장 가까운 검색량
+    left = c2.sort_values("_key")
+    right = t2[["_key", "search_interest"]].sort_values("_key")
+    m1 = pd.merge_asof(left, right, on="_key", direction="nearest").drop(columns="_key")
+    # 댓글이 없는 검색 날짜 → 빈 댓글 + 검색량 행 추가
+    comment_keys = set(c2["_key"])
+    extra = t2[~t2["_key"].isin(comment_keys)][["date", "search_interest"]].copy()
+    combined = pd.concat([m1, extra], ignore_index=True)
+    return combined.sort_values("date").reset_index(drop=True)
 
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
@@ -138,8 +140,8 @@ with st.sidebar:
         yt_key = st.text_input("YouTube API 키", type="password")
     if not serp_key:
         serp_key = st.text_input("SerpApi 키", type="password")
-    max_videos = st.slider("영상 수", 5, 50, 30)
-    max_comments = st.slider("영상당 댓글 수", 20, 200, 100, step=10)
+    max_videos = st.slider("영상 수", 10, 500, 100, step=10)
+    max_comments = st.slider("영상당 댓글 수", 20, 10000, 100, step=10)
 
 col1, col2 = st.columns([4, 1])
 keyword = col1.text_input("검색어", placeholder="예: 탕후루", label_visibility="collapsed")
@@ -152,7 +154,7 @@ if run:
         st.warning("검색어를 입력하세요.")
     else:
         kw = keyword.strip()
-        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중..."):
+        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중... (영상 많으면 몇 분 걸려요)"):
             df = crawl_comments(kw, yt_key, max_videos, max_comments)
         if df.empty:
             st.error("수집된 댓글이 없어요. 검색어나 API 키를 확인해 주세요.")
@@ -181,7 +183,7 @@ if run:
                 st.download_button("검색량 CSV", trend.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"{kw}_search_trend.csv", mime="text/csv")
 
-            st.subheader("③ 합친 파일 (댓글 + 그 시점 검색량)")
+            st.subheader("③ 합친 파일 (댓글 + 그 시점 검색량, 댓글 없는 날짜 포함)")
             st.dataframe(merged, use_container_width=True, height=260)
             st.download_button("⭐ 합친 CSV 다운로드",
                                merged.to_csv(index=False).encode("utf-8-sig"),
