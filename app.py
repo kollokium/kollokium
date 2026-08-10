@@ -1,4 +1,4 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일 =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일(날짜 기준) =====
 import time
 import requests
 import pandas as pd
@@ -96,16 +96,20 @@ def get_search_trend(keyword, start, end, serpapi_key):
         st.warning(f"검색량 추이 수집 실패: {e}")
         return pd.DataFrame()
 
-# ---------- (3) 두 파일 합치기 (댓글은 그대로, 그 달 검색량을 붙임) ----------
+# ---------- (3) 두 파일 합치기 (댓글 날짜에 가장 가까운 검색량을 붙임) ----------
 def merge_files(df_comments, df_trend):
     if df_trend.empty:
         out = df_comments.copy()
         out["search_interest"] = pd.NA
         return out
+    c = df_comments.copy()
+    c["_date"] = pd.to_datetime(c["comment_published_at"]).dt.tz_localize(None).dt.normalize()
     t = df_trend.copy()
-    t["comment_year_month"] = pd.to_datetime(t["date"]).dt.to_period("M").astype(str)
-    s_month = t.groupby("comment_year_month")["search_interest"].mean().round(1).reset_index()
-    return df_comments.merge(s_month, on="comment_year_month", how="left")
+    t["_date"] = pd.to_datetime(t["date"])
+    t = t[["_date", "search_interest"]].sort_values("_date")
+    c = c.sort_values("_date")
+    merged = pd.merge_asof(c, t, on="_date", direction="nearest")
+    return merged.drop(columns="_date").sort_values("comment_published_at").reset_index(drop=True)
 
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
@@ -169,7 +173,7 @@ if run:
                 st.download_button("검색량 CSV", trend.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"{kw}_search_trend.csv", mime="text/csv")
 
-            st.subheader("③ 합친 파일 (댓글 + 그 달 검색량)")
+            st.subheader("③ 합친 파일 (댓글 + 그 시점 검색량)")
             st.dataframe(merged, use_container_width=True, height=260)
             st.download_button("⭐ 합친 CSV 다운로드",
                                merged.to_csv(index=False).encode("utf-8-sig"),
