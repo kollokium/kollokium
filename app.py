@@ -1,4 +1,4 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 수집 웹앱 =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이(일별) 수집 웹앱 =====
 import time
 import pandas as pd
 import streamlit as st
@@ -68,9 +68,9 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
     df.sort_values("comment_published_at", inplace=True)
     return df.reset_index(drop=True)
 
-# ---------- (2) 구글 검색량 추이 수집 (429 재시도 포함) ----------
+# ---------- (2) 구글 검색량 추이 수집 (일별, 429 재시도 포함) ----------
 def get_search_trend(keyword, start, end, retries=3):
-    """댓글 기간에 맞춰 월별 검색 관심도(0~100) 수집. 429면 쉬었다 재시도."""
+    """댓글 기간에 맞춰 일별 검색 관심도(0~100) 수집. 429면 쉬었다 재시도."""
     for attempt in range(retries):
         try:
             pytrends = TrendReq(hl="ko", tz=540, timeout=(10, 25),
@@ -81,8 +81,8 @@ def get_search_trend(keyword, start, end, retries=3):
                 return pd.DataFrame()
             t = t.reset_index()[["date", keyword]]
             t.columns = ["date", "search_interest"]
-            t["year_month"] = pd.to_datetime(t["date"]).dt.to_period("M").astype(str)
-            return t.groupby("year_month")["search_interest"].mean().reset_index()
+            t["date"] = pd.to_datetime(t["date"]).dt.date   # 일별 그대로
+            return t
         except Exception:
             if attempt < retries - 1:
                 time.sleep(10)      # 10초 쉬고 재시도
@@ -92,7 +92,7 @@ def get_search_trend(keyword, start, end, retries=3):
 
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
-st.caption("검색어를 넣으면 유튜브 댓글과 구글 검색량 추이를 함께 수집합니다.")
+st.caption("검색어를 넣으면 유튜브 댓글과 구글 검색량 추이(일별)를 함께 수집합니다.")
 
 api_key = ""
 try:
@@ -138,11 +138,11 @@ if run:
             st.download_button("댓글 CSV 다운로드", df.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{kw}_comments.csv", mime="text/csv")
 
-            st.subheader("② 구글 검색량 추이 (월별, 0~100)")
+            st.subheader("② 구글 검색량 추이 (일별, 0~100)")
             if trend.empty:
                 st.info("검색량 추이를 못 가져왔어요. 구글 호출 제한(429)일 수 있으니 잠시 후 다시 검색해 보세요.")
             else:
-                st.line_chart(trend.set_index("year_month")["search_interest"])
+                st.line_chart(trend.set_index("date")["search_interest"])
                 st.dataframe(trend, use_container_width=True)
                 st.download_button("검색량 CSV 다운로드", trend.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"{kw}_search_trend.csv", mime="text/csv")
