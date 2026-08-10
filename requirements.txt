@@ -1,4 +1,6 @@
 streamlit
-google-api-python-client
 pandas
+numpy
+scikit-learn
 requests
+google-api-python-client
