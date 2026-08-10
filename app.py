@@ -1,26 +1,181 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일 =====
+# ===== app.py : 유행 데이터 수집 + 바이럴 동향 예측 =====
+# 팀원 크롤러(유튜브 댓글 + 구글 검색량) + 예측 모델 통합본
+# 필요 파일: app.py, train_data.csv (같은 폴더에 둘 것)
+# requirements: streamlit, pandas, numpy, scikit-learn, requests, google-api-python-client
+
+import os
 import time
 import requests
+import numpy as np
 import pandas as pd
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from sklearn.ensemble import GradientBoostingClassifier
 
-st.set_page_config(page_title="유행 데이터 수집기", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="유행 동향 예측기", page_icon="🔮", layout="wide")
 
-# ---------- (1) 유튜브 댓글 크롤러 ----------
-def crawl_comments(keyword, api_key, max_videos=100, max_comments=100):
+# =====================================================================
+# [예측 파트] 의미 범주 사전 — 품목이 바뀌어도 그대로 쓰이는 부분
+# =====================================================================
+FATIGUE  = ['지겹', '질리', '질렸', '물리', '식상', '뇌절', '그만', '노잼', '재미없', '뻔하']
+FORCED   = ['억지', '바이럴', '광고', '협찬', '마케팅', '강요', '띄우', '밀어']
+REJECT   = ['안사', '안먹', '별로', '맛없', '실망', '싫어', '비싸']
+POSITIVE = ['맛있', '존맛', '꿀맛', '먹고싶', '궁금', '사먹', '최고', '대박']
+FOODS = ['탕후루', '약과', '마카롱', '뚱카롱', '흑당', '버블티', '요아정', '떡볶이', '티라미수',
+         '달고나', '카스테라', '도너츠', '도넛', '붕어빵', '호떡', '와플', '크로플', '마라탕',
+         '초콜릿', '두바이', '소금빵', '베이글', '케이크', '쿠키', '아이스크림', '빙수',
+         '츄러스', '타르트', '푸딩', '연어', '깍두기', '대창', '버터떡', '두쫀쿠', '밤티',
+         '로제', '곱창', '마카', '슈크림', '탕수육', '젤리', '포켓몬', '소떡', '핫도그', '붕어']
+
+CATS = {'f_fatigue': FATIGUE, 'f_forced': FORCED, 'f_reject': REJECT, 'f_positive': POSITIVE}
+
+FEATS = ['rel', 'rel_ma4', 'rel_chg', 'cmt_chg'] + [
+    f + s for f in ['r_f_fatigue', 'r_f_forced', 'r_f_reject', 'r_f_positive', 'r_f_alt']
+    for s in ['_ma3', '_chg']
+]
+
+CAT_LABEL = {'f_forced': '강요감', 'f_alt': '대체재 언급',
+             'f_fatigue': '피로감', 'f_reject': '거부', 'f_positive': '긍정'}
+
+# 10개 품목 학습에서 나온 생애주기 단계별 평균 (%) — 비교 기준선
+STAGE_BASE = {
+    '상승기':    {'강요감': 0.46, '대체재 언급': 7.88, '피로감': 0.32, '거부': 1.46, '긍정': 10.46},
+    '정점 부근': {'강요감': 1.01, '대체재 언급': 10.76, '피로감': 0.60, '거부': 2.60, '긍정': 11.47},
+    '초기 하강': {'강요감': 0.47, '대체재 언급': 9.79, '피로감': 0.41, '거부': 2.41, '긍정': 11.40},
+    '후기 소멸': {'강요감': 0.33, '대체재 언급': 8.31, '피로감': 0.35, '거부': 1.54, '긍정': 7.63},
+}
+
+
+@st.cache_resource
+def load_model():
+    """동봉된 학습 데이터로 모델을 학습한다 (앱 시작 시 1회, 약 1초)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_data.csv")
+    if not os.path.exists(path):
+        return None, None
+    tr = pd.read_csv(path, encoding="utf-8-sig")
+    m = GradientBoostingClassifier(n_estimators=150, max_depth=3,
+                                   learning_rate=0.05, random_state=42)
+    m.fit(tr[FEATS].fillna(0), tr["label"])
+    return m, tr
+
+
+def build_weekly_features(merged, keyword):
+    """merged 데이터프레임 → 주간 피처 테이블.
+
+    학습 때와 완전히 동일한 방식으로 계산해야 예측이 맞는다.
+    - 품목명은 <PRODUCT>로 마스킹해 특정 품목에 의존하지 않게 함
+    - 가중치 = (1+ln(1+댓글 좋아요)) x (1+ln(1+영상 조회수))
+    """
+    df = merged.copy()
+    df = df.dropna(subset=["comment"])
+    if df.empty:
+        return pd.DataFrame()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df = df.dropna(subset=["date"])
+    df["comment"] = df["comment"].astype(str)
+    masked = df["comment"].str.replace(keyword, "<PRODUCT>", regex=False)
+
+    df["comment_like_count"] = pd.to_numeric(df.get("comment_like_count", 0), errors="coerce").fillna(0)
+    df["view_count"] = pd.to_numeric(df.get("view_count", 0), errors="coerce").fillna(0)
+    df["w"] = (1 + np.log1p(df["comment_like_count"])) * (1 + np.log1p(df["view_count"]))
+
+    for col, pats in CATS.items():
+        df[col] = masked.apply(lambda t: any(p in t for p in pats))
+    others = [f for f in FOODS if f != keyword]
+    df["f_alt"] = masked.apply(lambda t: any(o in t for o in others))
+
+    # 검색량: 날짜별 대표값 → 일 단위 보간
+    si_src = merged.copy()
+    si_src["date"] = pd.to_datetime(si_src["date"], errors="coerce").dt.normalize()
+    si = si_src.dropna(subset=["date"]).groupby("date")["search_interest"].first().sort_index()
+    si = pd.to_numeric(si, errors="coerce")
+    if si.dropna().empty:
+        return pd.DataFrame()
+    full = pd.date_range(si.index.min(), si.index.max(), freq="D")
+    si = si.reindex(full).interpolate().ffill().bfill()
+
+    g = df.groupby("date")
+    daily = pd.DataFrame({"n_comments": g.size(), "w_total": g["w"].sum()})
+    for c in list(CATS) + ["f_alt"]:
+        daily["w_" + c] = df[df[c]].groupby("date")["w"].sum()
+    daily = daily.reindex(full, fill_value=0).fillna(0)
+    daily["search"] = si
+
+    wk = daily.resample("W-MON").sum()
+    wk["search"] = daily["search"].resample("W-MON").mean()
+    for c in list(CATS) + ["f_alt"]:
+        wk["r_" + c] = np.where(wk["w_total"] > 0, wk["w_" + c] / wk["w_total"] * 100, np.nan)
+
+    wk = wk[wk["n_comments"] >= 5].copy()
+    if len(wk) < 3:
+        return pd.DataFrame()
+
+    peak_val = wk["search"].max()
+    wk["rel"] = wk["search"] / peak_val * 100 if peak_val > 0 else 0
+    wk["rel_ma4"] = wk["rel"].rolling(4, min_periods=1).mean()
+    wk["rel_chg"] = wk["rel"].pct_change(4).replace([np.inf, -np.inf], np.nan)
+    wk["cmt_chg"] = wk["n_comments"].pct_change(4).replace([np.inf, -np.inf], np.nan)
+    for c in list(CATS) + ["f_alt"]:
+        wk["r_" + c + "_ma3"] = wk["r_" + c].rolling(3, min_periods=1).mean()
+        wk["r_" + c + "_chg"] = wk["r_" + c + "_ma3"].diff(4)
+
+    wk["weeks_from_peak"] = ((wk.index - wk["search"].idxmax()).days / 7).astype(int)
+    return wk
+
+
+def judge_stage(row, recent_trend=0.0):
+    """현재 국면을 판정한다.
+
+    weeks_from_peak(정점 기준 주차)만 쓰면, 데이터 기간이 길고 과거에 더 큰
+    정점이 있었던 품목에서 최근의 재상승을 놓친다. 그래서 최근 추세
+    (recent_trend = 최근 8주 상대검색량 변화량)를 함께 본다.
+    """
+    w, r = row["weeks_from_peak"], row["rel"]
+    # 최근 뚜렷하게 오르는 중이면, 과거 정점과 무관하게 상승 국면으로 본다
+    if recent_trend > 8 and r >= 15:
+        return "상승기"
+    if w < 0:
+        return "상승기"
+    if w <= 4:
+        return "정점 부근"
+    if r >= 30:
+        return "초기 하강"
+    return "후기 소멸"
+
+
+def recent_trend_of(wk, weeks=8):
+    """최근 N주 동안 상대검색량이 얼마나 올랐는지(%p)."""
+    s = wk["rel"].dropna()
+    if len(s) < 3:
+        return 0.0
+    tail = s.tail(weeks)
+    return float(tail.iloc[-1] - tail.iloc[0])
+
+
+STAGE_MSG = {
+    "상승기": "아직 정점 전입니다. 유행이 커지는 중이라 재료 확보 여력이 있지만, "
+              "**강요감과 대체재 언급이 함께 뛰기 시작하면** 고비가 가깝다는 신호입니다.",
+    "정점 부근": "**가장 주의해야 할 구간**입니다. 학습한 14개 품목 평균으로 이 시점에서 "
+                 "강요감이 상승기의 약 2.2배로 올랐습니다. 대량 발주는 이 시점부터 위험합니다.",
+    "초기 하강": "정점을 지나 내려오는 중입니다. 학습한 품목들은 이 구간에서 "
+                 "**평균 4~8주에 걸쳐** 정점 대비 30% 아래로 떨어졌습니다. 재고 소진 계획이 필요합니다.",
+    "후기 소멸": "이미 많이 내려온 상태입니다. 남은 하락 폭이 작아 급락 위험은 줄었지만, "
+                 "**이 수준에서 정착할지 완전히 사라질지**는 품목마다 갈렸습니다.",
+}
+
+
+# =====================================================================
+# [수집 파트] 유튜브 댓글 크롤러
+# =====================================================================
+def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
     yt = build("youtube", "v3", developerKey=api_key)
     ids, seen, page = [], set(), None
     while len(ids) < max_videos:
-        try:
-            res = yt.search().list(q=keyword, part="id", type="video",
-                maxResults=min(50, max_videos - len(ids)), pageToken=page,
-                regionCode="KR", relevanceLanguage="ko").execute()
-        except HttpError as e:
-            st.error(f"유튜브 검색 실패: {e}")
-            st.info("대부분 '오늘 할당량 초과'예요. 한국시간 오후 4~5시경 리셋되니 그 후에 다시, 또는 영상 수를 줄여보세요.")
-            return pd.DataFrame()
+        res = yt.search().list(q=keyword, part="id", type="video",
+            maxResults=min(50, max_videos - len(ids)), pageToken=page,
+            regionCode="KR", relevanceLanguage="ko").execute()
         for it in res.get("items", []):
             v = it["id"]["videoId"]
             if v not in seen:
@@ -30,11 +185,8 @@ def crawl_comments(keyword, api_key, max_videos=100, max_comments=100):
             break
     details = {}
     for i in range(0, len(ids), 50):
-        try:
-            res = yt.videos().list(part="snippet,statistics",
-                                   id=",".join(ids[i:i+50])).execute()
-        except HttpError:
-            continue
+        res = yt.videos().list(part="snippet,statistics",
+                               id=",".join(ids[i:i+50])).execute()
         for it in res.get("items", []):
             s, stt = it["snippet"], it.get("statistics", {})
             details[it["id"]] = {
@@ -76,10 +228,10 @@ def crawl_comments(keyword, api_key, max_videos=100, max_comments=100):
     df.sort_values("comment_published_at", inplace=True)
     return df.reset_index(drop=True)
 
-# ---------- (2) 구글 검색량 추이 수집 (SerpApi) ----------
+
 def get_search_trend(keyword, start, end, serpapi_key):
     if not serpapi_key:
-        st.info("검색량 추이는 SerpApi 키가 있어야 나와요. (사이드바에 입력)")
+        st.info("검색량 추이는 SerpApi 키가 있어야 나옵니다. (사이드바에 입력)")
         return pd.DataFrame()
     try:
         params = {
@@ -104,7 +256,7 @@ def get_search_trend(keyword, start, end, serpapi_key):
         st.warning(f"검색량 추이 수집 실패: {e}")
         return pd.DataFrame()
 
-# ---------- (3) 두 파일 합치기 (댓글 없는 검색 날짜도 포함) ----------
+
 def merge_files(df_comments, df_trend):
     c = df_comments.copy()
     c["date"] = pd.to_datetime(c["comment_published_at"], utc=True, errors="coerce") \
@@ -127,9 +279,14 @@ def merge_files(df_comments, df_trend):
     combined = pd.concat([m1, extra], ignore_index=True)
     return combined.sort_values("date").reset_index(drop=True)
 
-# ---------- 화면 ----------
-st.title("🔎 유행 데이터 수집기")
-st.caption("검색어를 넣으면 유튜브 댓글·구글 검색량 추이·둘을 합친 파일을 만듭니다.")
+
+# =====================================================================
+# 화면
+# =====================================================================
+st.title("🔮 유행 동향 예측기")
+st.caption("품목을 넣으면 유튜브 댓글과 검색량을 모아, 지금 유행이 어느 국면에 있는지 읽어냅니다.")
+
+model, train_ref = load_model()
 
 try:
     yt_key = st.secrets["YOUTUBE_API_KEY"]
@@ -148,22 +305,28 @@ with st.sidebar:
         serp_key = st.text_input("SerpApi 키", type="password")
     max_videos = st.slider("영상 수", 10, 500, 100, step=10)
     max_comments = st.slider("영상당 댓글 수", 20, 10000, 100, step=10)
+    st.divider()
+    if model is None:
+        st.error("train_data.csv 가 없어 예측을 쓸 수 없습니다. app.py와 같은 폴더에 두세요.")
+    else:
+        st.success(f"예측 모델 준비됨 (14개 품목 {len(train_ref):,}주 학습)")
+        st.caption("품목 교차검증 AUC 0.661 — 프로토타입 단계")
 
 col1, col2 = st.columns([4, 1])
-keyword = col1.text_input("검색어", placeholder="예: 탕후루", label_visibility="collapsed")
-run = col2.button("검색", type="primary", use_container_width=True)
+keyword = col1.text_input("품목", placeholder="예: 탕후루", label_visibility="collapsed")
+run = col2.button("분석", type="primary", use_container_width=True)
 
 if run:
     if not yt_key:
         st.error("YouTube API 키를 입력하세요. (사이드바)")
     elif not keyword.strip():
-        st.warning("검색어를 입력하세요.")
+        st.warning("품목을 입력하세요.")
     else:
         kw = keyword.strip()
-        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중... (영상 많으면 몇 분 걸려요)"):
+        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중... (영상이 많으면 몇 분 걸립니다)"):
             df = crawl_comments(kw, yt_key, max_videos, max_comments)
         if df.empty:
-            st.warning("수집된 댓글이 없어요. (위 오류 메시지 또는 검색어/키/할당량을 확인해 주세요.)")
+            st.error("수집된 댓글이 없습니다. 품목명이나 API 키를 확인해 주세요.")
         else:
             start = df["comment_published_at"].min().strftime("%Y-%m-%d")
             end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
@@ -176,23 +339,68 @@ if run:
             c2.metric("영상 수", f"{df['video_id'].nunique():,}")
             c3.metric("댓글 기간", f"{df['comment_published_at'].min().date()} ~ {df['comment_published_at'].max().date()}")
 
+            # ============ 예측 ============
+            st.subheader("🔮 바이럴 동향 예측")
+            if trend.empty:
+                st.warning("검색량 데이터가 없어 예측을 할 수 없습니다. SerpApi 키를 확인해 주세요.")
+            elif model is None:
+                st.warning("train_data.csv 가 없어 예측을 할 수 없습니다.")
+            else:
+                wk = build_weekly_features(merged, kw)
+                if wk.empty:
+                    st.warning("주간 데이터가 부족해 예측할 수 없습니다. 영상 수를 늘려 다시 시도해 보세요.")
+                else:
+                    last = wk.iloc[-1]
+                    stage = judge_stage(last, recent_trend_of(wk))
+                    X = wk[FEATS].fillna(0).iloc[[-1]]
+                    prob = float(model.predict_proba(X)[0, 1])
+
+                    a, b = st.columns([1, 2])
+                    a.metric("현재 국면", stage)
+                    b.metric("4주 내 15% 이상 하락 가능성", f"{prob*100:.0f}%")
+                    st.progress(min(max(prob, 0.0), 1.0))
+                    st.info(STAGE_MSG[stage])
+
+                    st.markdown("**댓글 신호 — 14개 품목 같은 국면 평균과 비교**")
+                    base = STAGE_BASE[stage]
+                    cols = st.columns(5)
+                    for i, (col_key, label) in enumerate(CAT_LABEL.items()):
+                        val = float(wk["r_" + col_key + "_ma3"].iloc[-1])
+                        ref = base[label]
+                        diff = val - ref
+                        cols[i].metric(label, f"{val:.2f}%", f"{diff:+.2f}%p")
+                    st.caption("위 화살표는 같은 국면에 있던 14개 품목 평균과의 차이입니다. "
+                               "강요감·대체재 언급이 평균보다 크게 높으면 고비가 빨리 올 수 있습니다.")
+
+                    with st.expander("주간 분석 데이터 보기"):
+                        show = wk[["search", "rel", "n_comments", "r_f_forced_ma3",
+                                   "r_f_alt_ma3", "r_f_fatigue_ma3", "weeks_from_peak"]].copy()
+                        show.columns = ["검색량", "정점대비(%)", "댓글수", "강요감(%)",
+                                        "대체재(%)", "피로감(%)", "정점기준주차"]
+                        st.dataframe(show.round(2), use_container_width=True)
+
+                    st.warning("이 예측은 14개 품목으로 학습한 **프로토타입**입니다. "
+                               "품목 교차검증 AUC 0.661로 무작위보다는 낫지만 실무 배포 기준에는 미치지 못하며, "
+                               "품목에 따라 편차가 큽니다. 발주 판단의 유일한 근거로 삼지 마세요.")
+
+            # ============ 수집 데이터 ============
             st.subheader("① 유튜브 댓글")
-            st.dataframe(df, use_container_width=True, height=260)
+            st.dataframe(df, use_container_width=True, height=240)
             st.download_button("댓글 CSV", df.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{kw}_comments.csv", mime="text/csv")
 
             st.subheader("② 구글 검색량 추이 (0~100)")
             if trend.empty:
-                st.info("검색량 추이를 못 가져왔어요. SerpApi 키/사용량을 확인해 주세요.")
+                st.info("검색량 추이를 가져오지 못했습니다. SerpApi 키와 사용량을 확인해 주세요.")
             else:
                 st.line_chart(trend.set_index("date")["search_interest"])
                 st.download_button("검색량 CSV", trend.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"{kw}_search_trend.csv", mime="text/csv")
 
-            st.subheader("③ 합친 파일 (댓글 + 그 시점 검색량, 댓글 없는 날짜 포함)")
-            st.dataframe(merged, use_container_width=True, height=260)
+            st.subheader("③ 합친 파일 (댓글 + 그 시점 검색량)")
+            st.dataframe(merged, use_container_width=True, height=240)
             st.download_button("⭐ 합친 CSV 다운로드",
                                merged.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{kw}_merged.csv", mime="text/csv")
 else:
-    st.info("검색어를 넣고 '검색'을 누르세요.")
+    st.info("품목을 넣고 '분석'을 누르세요.")
