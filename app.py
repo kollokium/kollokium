@@ -1,4 +1,4 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이(SerpApi) 수집 웹앱 =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 통합 데이터셋 =====
 import time
 import requests
 import pandas as pd
@@ -70,7 +70,6 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
 
 # ---------- (2) 구글 검색량 추이 수집 (SerpApi) ----------
 def get_search_trend(keyword, start, end, serpapi_key):
-    """SerpApi 구글 트렌드로 기간별 검색 관심도(0~100) 수집. 429 없음."""
     if not serpapi_key:
         st.info("검색량 추이는 SerpApi 키가 있어야 나와요. (사이드바에 입력)")
         return pd.DataFrame()
@@ -97,11 +96,28 @@ def get_search_trend(keyword, start, end, serpapi_key):
         st.warning(f"검색량 추이 수집 실패: {e}")
         return pd.DataFrame()
 
+# ---------- (3) 두 데이터를 월별로 합치기 (전처리) ----------
+def build_merged(df_comments, df_trend):
+    """월별 댓글 수 + 월별 평균 검색관심도를 year_month 기준으로 하나로 합침."""
+    c_month = (df_comments.groupby("comment_year_month").size()
+               .reset_index(name="comment_count")
+               .rename(columns={"comment_year_month": "year_month"}))
+    if df_trend.empty:
+        merged = c_month.copy()
+        merged["search_interest"] = 0.0
+        return merged.sort_values("year_month").reset_index(drop=True)
+    t = df_trend.copy()
+    t["year_month"] = pd.to_datetime(t["date"]).dt.to_period("M").astype(str)
+    s_month = (t.groupby("year_month")["search_interest"].mean().round(1).reset_index())
+    merged = pd.merge(c_month, s_month, on="year_month", how="outer").sort_values("year_month")
+    merged["comment_count"] = merged["comment_count"].fillna(0).astype(int)
+    merged["search_interest"] = merged["search_interest"].fillna(0)
+    return merged.reset_index(drop=True)
+
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
-st.caption("검색어를 넣으면 유튜브 댓글과 구글 검색량 추이를 함께 수집합니다.")
+st.caption("검색어를 넣으면 유튜브 댓글·구글 검색량 추이·둘을 합친 통합 데이터를 만듭니다.")
 
-# 키: 배포 시 st.secrets, 없으면 사이드바 입력
 try:
     yt_key = st.secrets["YOUTUBE_API_KEY"]
 except Exception:
@@ -140,6 +156,7 @@ if run:
             end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
             with st.spinner("구글 검색량 추이 수집 중..."):
                 trend = get_search_trend(kw, start, end, serp_key)
+            merged = build_merged(df, trend)
 
             c1, c2, c3 = st.columns(3)
             c1.metric("수집 댓글", f"{len(df):,}")
@@ -147,8 +164,8 @@ if run:
             c3.metric("댓글 기간", f"{df['comment_published_at'].min().date()} ~ {df['comment_published_at'].max().date()}")
 
             st.subheader("① 유튜브 댓글")
-            st.dataframe(df, use_container_width=True, height=320)
-            st.download_button("댓글 CSV 다운로드", df.to_csv(index=False).encode("utf-8-sig"),
+            st.dataframe(df, use_container_width=True, height=280)
+            st.download_button("댓글 CSV", df.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{kw}_comments.csv", mime="text/csv")
 
             st.subheader("② 구글 검색량 추이 (0~100)")
@@ -156,8 +173,13 @@ if run:
                 st.info("검색량 추이를 못 가져왔어요. SerpApi 키/사용량을 확인해 주세요.")
             else:
                 st.line_chart(trend.set_index("date")["search_interest"])
-                st.dataframe(trend, use_container_width=True)
-                st.download_button("검색량 CSV 다운로드", trend.to_csv(index=False).encode("utf-8-sig"),
+                st.download_button("검색량 CSV", trend.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"{kw}_search_trend.csv", mime="text/csv")
+
+            st.subheader("③ 통합 데이터셋 (월별: 댓글 수 + 검색관심도)")
+            st.dataframe(merged, use_container_width=True)
+            st.download_button("⭐ 통합 CSV 다운로드",
+                               merged.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{kw}_merged_monthly.csv", mime="text/csv")
 else:
     st.info("검색어를 넣고 '검색'을 누르세요.")
