@@ -1,10 +1,10 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이(일별) 수집 웹앱 =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이(SerpApi) 수집 웹앱 =====
 import time
+import requests
 import pandas as pd
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from pytrends.request import TrendReq
 
 st.set_page_config(page_title="유행 데이터 수집기", page_icon="🔎", layout="wide")
 
@@ -68,42 +68,55 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
     df.sort_values("comment_published_at", inplace=True)
     return df.reset_index(drop=True)
 
-# ---------- (2) 구글 검색량 추이 수집 (일별, 429 재시도 포함) ----------
-def get_search_trend(keyword, start, end, retries=3):
-    """댓글 기간에 맞춰 일별 검색 관심도(0~100) 수집. 429면 쉬었다 재시도."""
-    for attempt in range(retries):
-        try:
-            pytrends = TrendReq(hl="ko", tz=540, timeout=(10, 25),
-                                retries=2, backoff_factor=0.5)
-            pytrends.build_payload([keyword], geo="KR", timeframe=f"{start} {end}")
-            t = pytrends.interest_over_time()
-            if t.empty:
-                return pd.DataFrame()
-            t = t.reset_index()[["date", keyword]]
-            t.columns = ["date", "search_interest"]
-            t["date"] = pd.to_datetime(t["date"]).dt.date   # 일별 그대로
-            return t
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(10)      # 10초 쉬고 재시도
-                continue
-            st.warning("검색량 추이 수집 실패(구글 호출 제한 429). 잠시 후 다시 검색해 보세요.")
+# ---------- (2) 구글 검색량 추이 수집 (SerpApi) ----------
+def get_search_trend(keyword, start, end, serpapi_key):
+    """SerpApi 구글 트렌드로 기간별 검색 관심도(0~100) 수집. 429 없음."""
+    if not serpapi_key:
+        st.info("검색량 추이는 SerpApi 키가 있어야 나와요. (사이드바에 입력)")
+        return pd.DataFrame()
+    try:
+        params = {
+            "engine": "google_trends", "q": keyword, "data_type": "TIMESERIES",
+            "date": f"{start} {end}", "geo": "KR", "hl": "ko", "api_key": serpapi_key,
+        }
+        r = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
+        data = r.json()
+        if "error" in data:
+            st.warning(f"검색량 수집 오류: {data['error']}")
             return pd.DataFrame()
+        timeline = data.get("interest_over_time", {}).get("timeline_data", [])
+        rows = []
+        for pt in timeline:
+            ts = pt.get("timestamp")
+            vals = pt.get("values", [])
+            val = vals[0].get("extracted_value", 0) if vals else 0
+            d = pd.to_datetime(int(ts), unit="s").date() if ts else pt.get("date")
+            rows.append({"date": d, "search_interest": val})
+        return pd.DataFrame(rows)
+    except Exception as e:
+        st.warning(f"검색량 추이 수집 실패: {e}")
+        return pd.DataFrame()
 
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
-st.caption("검색어를 넣으면 유튜브 댓글과 구글 검색량 추이(일별)를 함께 수집합니다.")
+st.caption("검색어를 넣으면 유튜브 댓글과 구글 검색량 추이를 함께 수집합니다.")
 
-api_key = ""
+# 키: 배포 시 st.secrets, 없으면 사이드바 입력
 try:
-    api_key = st.secrets["YOUTUBE_API_KEY"]
+    yt_key = st.secrets["YOUTUBE_API_KEY"]
 except Exception:
-    api_key = ""
+    yt_key = ""
+try:
+    serp_key = st.secrets["SERPAPI_KEY"]
+except Exception:
+    serp_key = ""
 
 with st.sidebar:
     st.header("설정")
-    if not api_key:
-        api_key = st.text_input("YouTube API 키", type="password")
+    if not yt_key:
+        yt_key = st.text_input("YouTube API 키", type="password")
+    if not serp_key:
+        serp_key = st.text_input("SerpApi 키", type="password")
     max_videos = st.slider("영상 수", 5, 50, 30)
     max_comments = st.slider("영상당 댓글 수", 20, 200, 100, step=10)
 
@@ -112,21 +125,21 @@ keyword = col1.text_input("검색어", placeholder="예: 탕후루", label_visib
 run = col2.button("검색", type="primary", use_container_width=True)
 
 if run:
-    if not api_key:
-        st.error("API 키를 입력하세요. (사이드바)")
+    if not yt_key:
+        st.error("YouTube API 키를 입력하세요. (사이드바)")
     elif not keyword.strip():
         st.warning("검색어를 입력하세요.")
     else:
         kw = keyword.strip()
         with st.spinner(f"'{kw}' 유튜브 댓글 수집 중..."):
-            df = crawl_comments(kw, api_key, max_videos, max_comments)
+            df = crawl_comments(kw, yt_key, max_videos, max_comments)
         if df.empty:
             st.error("수집된 댓글이 없어요. 검색어나 API 키를 확인해 주세요.")
         else:
             start = df["comment_published_at"].min().strftime("%Y-%m-%d")
             end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
-            with st.spinner("구글 검색량 추이 수집 중... (최대 30초)"):
-                trend = get_search_trend(kw, start, end)
+            with st.spinner("구글 검색량 추이 수집 중..."):
+                trend = get_search_trend(kw, start, end, serp_key)
 
             c1, c2, c3 = st.columns(3)
             c1.metric("수집 댓글", f"{len(df):,}")
@@ -138,9 +151,9 @@ if run:
             st.download_button("댓글 CSV 다운로드", df.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{kw}_comments.csv", mime="text/csv")
 
-            st.subheader("② 구글 검색량 추이 (일별, 0~100)")
+            st.subheader("② 구글 검색량 추이 (0~100)")
             if trend.empty:
-                st.info("검색량 추이를 못 가져왔어요. 구글 호출 제한(429)일 수 있으니 잠시 후 다시 검색해 보세요.")
+                st.info("검색량 추이를 못 가져왔어요. SerpApi 키/사용량을 확인해 주세요.")
             else:
                 st.line_chart(trend.set_index("date")["search_interest"])
                 st.dataframe(trend, use_container_width=True)
