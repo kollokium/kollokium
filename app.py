@@ -103,11 +103,12 @@ def merge_files(df_comments, df_trend):
         out["search_interest"] = pd.NA
         return out
     c = df_comments.copy()
-    c["_date"] = pd.to_datetime(c["comment_published_at"]).dt.tz_localize(None).dt.normalize()
+    c["_date"] = pd.to_datetime(c["comment_published_at"], utc=True, errors="coerce") \
+                   .dt.tz_localize(None).dt.normalize()
     t = df_trend.copy()
-    t["_date"] = pd.to_datetime(t["date"])
-    t = t[["_date", "search_interest"]].sort_values("_date")
-    c = c.sort_values("_date")
+    t["_date"] = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
+    t = t[["_date", "search_interest"]].dropna(subset=["_date"]).sort_values("_date")
+    c = c.dropna(subset=["_date"]).sort_values("_date")
     merged = pd.merge_asof(c, t, on="_date", direction="nearest")
     return merged.drop(columns="_date").sort_values("comment_published_at").reset_index(drop=True)
 
