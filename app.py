@@ -68,22 +68,27 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
     df.sort_values("comment_published_at", inplace=True)
     return df.reset_index(drop=True)
 
-# ---------- (2) 구글 검색량 추이 수집 ----------
-def get_search_trend(keyword, start, end):
-    """댓글 기간(start~end)에 맞춰 월별 검색 관심도(0~100)를 수집."""
-    try:
-        pytrends = TrendReq(hl="ko", tz=540)
-        pytrends.build_payload([keyword], geo="KR", timeframe=f"{start} {end}")
-        t = pytrends.interest_over_time()
-        if t.empty:
+# ---------- (2) 구글 검색량 추이 수집 (429 재시도 포함) ----------
+def get_search_trend(keyword, start, end, retries=3):
+    """댓글 기간에 맞춰 월별 검색 관심도(0~100) 수집. 429면 쉬었다 재시도."""
+    for attempt in range(retries):
+        try:
+            pytrends = TrendReq(hl="ko", tz=540, timeout=(10, 25),
+                                retries=2, backoff_factor=0.5)
+            pytrends.build_payload([keyword], geo="KR", timeframe=f"{start} {end}")
+            t = pytrends.interest_over_time()
+            if t.empty:
+                return pd.DataFrame()
+            t = t.reset_index()[["date", keyword]]
+            t.columns = ["date", "search_interest"]
+            t["year_month"] = pd.to_datetime(t["date"]).dt.to_period("M").astype(str)
+            return t.groupby("year_month")["search_interest"].mean().reset_index()
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(10)      # 10초 쉬고 재시도
+                continue
+            st.warning("검색량 추이 수집 실패(구글 호출 제한 429). 잠시 후 다시 검색해 보세요.")
             return pd.DataFrame()
-        t = t.reset_index()[["date", keyword]]
-        t.columns = ["date", "search_interest"]
-        t["year_month"] = pd.to_datetime(t["date"]).dt.to_period("M").astype(str)
-        return t.groupby("year_month")["search_interest"].mean().reset_index()
-    except Exception as e:
-        st.warning(f"검색량 추이 수집 실패(잠시 후 재시도): {e}")
-        return pd.DataFrame()
 
 # ---------- 화면 ----------
 st.title("🔎 유행 데이터 수집기")
@@ -118,10 +123,9 @@ if run:
         if df.empty:
             st.error("수집된 댓글이 없어요. 검색어나 API 키를 확인해 주세요.")
         else:
-            # 댓글 기간에 맞춰 검색량 추이 수집
             start = df["comment_published_at"].min().strftime("%Y-%m-%d")
             end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
-            with st.spinner("구글 검색량 추이 수집 중..."):
+            with st.spinner("구글 검색량 추이 수집 중... (최대 30초)"):
                 trend = get_search_trend(kw, start, end)
 
             c1, c2, c3 = st.columns(3)
@@ -136,7 +140,7 @@ if run:
 
             st.subheader("② 구글 검색량 추이 (월별, 0~100)")
             if trend.empty:
-                st.info("검색량 추이를 못 가져왔어요. 구글 호출 제한일 수 있으니 잠시 후 다시 검색해 보세요.")
+                st.info("검색량 추이를 못 가져왔어요. 구글 호출 제한(429)일 수 있으니 잠시 후 다시 검색해 보세요.")
             else:
                 st.line_chart(trend.set_index("year_month")["search_interest"])
                 st.dataframe(trend, use_container_width=True)
