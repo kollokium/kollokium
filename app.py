@@ -1,13 +1,14 @@
-# ===== app.py : 검색창이 있는 유튜브 댓글 크롤링 웹앱 =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 수집 웹앱 =====
 import time
 import pandas as pd
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from pytrends.request import TrendReq
 
-st.set_page_config(page_title="유튜브 댓글 크롤러", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="유행 데이터 수집기", page_icon="🔎", layout="wide")
 
-# ---------- 크롤러 (당신 파트) ----------
+# ---------- (1) 유튜브 댓글 크롤러 ----------
 def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
     yt = build("youtube", "v3", developerKey=api_key)
     ids, seen, page = [], set(), None
@@ -22,7 +23,6 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
         page = res.get("nextPageToken")
         if not page:
             break
-
     details = {}
     for i in range(0, len(ids), 50):
         res = yt.videos().list(part="snippet,statistics",
@@ -33,9 +33,8 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
                 "video_title": s["title"], "channel_title": s["channelTitle"],
                 "view_count": int(stt["viewCount"]) if "viewCount" in stt else None,
                 "video_published_at": s["publishedAt"]}
-
     records = []
-    prog = st.progress(0.0, text="댓글 수집 중...")
+    prog = st.progress(0.0, text="유튜브 댓글 수집 중...")
     for i, v in enumerate(ids, 1):
         page = None; got = 0
         while got < max_comments:
@@ -55,9 +54,8 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
             if not page:
                 break
             time.sleep(0.1)
-        prog.progress(i / max(1, len(ids)), text=f"댓글 수집 중... ({i}/{len(ids)})")
+        prog.progress(i / max(1, len(ids)), text=f"유튜브 댓글 수집 중... ({i}/{len(ids)})")
     prog.empty()
-
     if not records:
         return pd.DataFrame()
     df = pd.DataFrame(records)
@@ -70,11 +68,27 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
     df.sort_values("comment_published_at", inplace=True)
     return df.reset_index(drop=True)
 
-# ---------- 화면 ----------
-st.title("🔎 유튜브 댓글 크롤러")
-st.caption("검색어를 넣으면 관련 유튜브 영상의 댓글을 수집합니다.")
+# ---------- (2) 구글 검색량 추이 수집 ----------
+def get_search_trend(keyword, start, end):
+    """댓글 기간(start~end)에 맞춰 월별 검색 관심도(0~100)를 수집."""
+    try:
+        pytrends = TrendReq(hl="ko", tz=540)
+        pytrends.build_payload([keyword], geo="KR", timeframe=f"{start} {end}")
+        t = pytrends.interest_over_time()
+        if t.empty:
+            return pd.DataFrame()
+        t = t.reset_index()[["date", keyword]]
+        t.columns = ["date", "search_interest"]
+        t["year_month"] = pd.to_datetime(t["date"]).dt.to_period("M").astype(str)
+        return t.groupby("year_month")["search_interest"].mean().reset_index()
+    except Exception as e:
+        st.warning(f"검색량 추이 수집 실패(잠시 후 재시도): {e}")
+        return pd.DataFrame()
 
-# API 키: 배포 시엔 st.secrets, 로컬/테스트 땐 입력창
+# ---------- 화면 ----------
+st.title("🔎 유행 데이터 수집기")
+st.caption("검색어를 넣으면 유튜브 댓글과 구글 검색량 추이를 함께 수집합니다.")
+
 api_key = ""
 try:
     api_key = st.secrets["YOUTUBE_API_KEY"]
@@ -88,7 +102,6 @@ with st.sidebar:
     max_videos = st.slider("영상 수", 5, 50, 30)
     max_comments = st.slider("영상당 댓글 수", 20, 200, 100, step=10)
 
-# 네이버처럼 검색창 + 버튼
 col1, col2 = st.columns([4, 1])
 keyword = col1.text_input("검색어", placeholder="예: 탕후루", label_visibility="collapsed")
 run = col2.button("검색", type="primary", use_container_width=True)
@@ -99,17 +112,35 @@ if run:
     elif not keyword.strip():
         st.warning("검색어를 입력하세요.")
     else:
-        with st.spinner(f"'{keyword}' 댓글 수집 중..."):
-            df = crawl_comments(keyword.strip(), api_key, max_videos, max_comments)
+        kw = keyword.strip()
+        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중..."):
+            df = crawl_comments(kw, api_key, max_videos, max_comments)
         if df.empty:
             st.error("수집된 댓글이 없어요. 검색어나 API 키를 확인해 주세요.")
         else:
+            # 댓글 기간에 맞춰 검색량 추이 수집
+            start = df["comment_published_at"].min().strftime("%Y-%m-%d")
+            end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
+            with st.spinner("구글 검색량 추이 수집 중..."):
+                trend = get_search_trend(kw, start, end)
+
             c1, c2, c3 = st.columns(3)
             c1.metric("수집 댓글", f"{len(df):,}")
             c2.metric("영상 수", f"{df['video_id'].nunique():,}")
-            c3.metric("기간", f"{df['comment_published_at'].min().date()} ~ {df['comment_published_at'].max().date()}")
-            st.dataframe(df, use_container_width=True, height=400)
-            st.download_button("CSV 다운로드", df.to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"{keyword}_comments.csv", mime="text/csv")
+            c3.metric("댓글 기간", f"{df['comment_published_at'].min().date()} ~ {df['comment_published_at'].max().date()}")
+
+            st.subheader("① 유튜브 댓글")
+            st.dataframe(df, use_container_width=True, height=320)
+            st.download_button("댓글 CSV 다운로드", df.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{kw}_comments.csv", mime="text/csv")
+
+            st.subheader("② 구글 검색량 추이 (월별, 0~100)")
+            if trend.empty:
+                st.info("검색량 추이를 못 가져왔어요. 구글 호출 제한일 수 있으니 잠시 후 다시 검색해 보세요.")
+            else:
+                st.line_chart(trend.set_index("year_month")["search_interest"])
+                st.dataframe(trend, use_container_width=True)
+                st.download_button("검색량 CSV 다운로드", trend.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"{kw}_search_trend.csv", mime="text/csv")
 else:
     st.info("검색어를 넣고 '검색'을 누르세요.")
