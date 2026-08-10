@@ -1,4 +1,4 @@
-# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일(댓글없는 날짜 포함) =====
+# ===== app.py : 유튜브 댓글 + 구글 검색량 추이 + 합친 파일 =====
 import time
 import requests
 import pandas as pd
@@ -9,13 +9,18 @@ from googleapiclient.errors import HttpError
 st.set_page_config(page_title="유행 데이터 수집기", page_icon="🔎", layout="wide")
 
 # ---------- (1) 유튜브 댓글 크롤러 ----------
-def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
+def crawl_comments(keyword, api_key, max_videos=100, max_comments=100):
     yt = build("youtube", "v3", developerKey=api_key)
     ids, seen, page = [], set(), None
     while len(ids) < max_videos:
-        res = yt.search().list(q=keyword, part="id", type="video",
-            maxResults=min(50, max_videos - len(ids)), pageToken=page,
-            regionCode="KR", relevanceLanguage="ko").execute()
+        try:
+            res = yt.search().list(q=keyword, part="id", type="video",
+                maxResults=min(50, max_videos - len(ids)), pageToken=page,
+                regionCode="KR", relevanceLanguage="ko").execute()
+        except HttpError as e:
+            st.error(f"유튜브 검색 실패: {e}")
+            st.info("대부분 '오늘 할당량 초과'예요. 한국시간 오후 4~5시경 리셋되니 그 후에 다시, 또는 영상 수를 줄여보세요.")
+            return pd.DataFrame()
         for it in res.get("items", []):
             v = it["id"]["videoId"]
             if v not in seen:
@@ -25,8 +30,11 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100):
             break
     details = {}
     for i in range(0, len(ids), 50):
-        res = yt.videos().list(part="snippet,statistics",
-                               id=",".join(ids[i:i+50])).execute()
+        try:
+            res = yt.videos().list(part="snippet,statistics",
+                                   id=",".join(ids[i:i+50])).execute()
+        except HttpError:
+            continue
         for it in res.get("items", []):
             s, stt = it["snippet"], it.get("statistics", {})
             details[it["id"]] = {
@@ -111,11 +119,9 @@ def merge_files(df_comments, df_trend):
     c2["_key"] = c2["date"].map(lambda x: x.toordinal())
     t2 = t.copy()
     t2["_key"] = t2["date"].map(lambda x: x.toordinal())
-    # 댓글 행 + 가장 가까운 검색량
     left = c2.sort_values("_key")
     right = t2[["_key", "search_interest"]].sort_values("_key")
     m1 = pd.merge_asof(left, right, on="_key", direction="nearest").drop(columns="_key")
-    # 댓글이 없는 검색 날짜 → 빈 댓글 + 검색량 행 추가
     comment_keys = set(c2["_key"])
     extra = t2[~t2["_key"].isin(comment_keys)][["date", "search_interest"]].copy()
     combined = pd.concat([m1, extra], ignore_index=True)
@@ -157,7 +163,7 @@ if run:
         with st.spinner(f"'{kw}' 유튜브 댓글 수집 중... (영상 많으면 몇 분 걸려요)"):
             df = crawl_comments(kw, yt_key, max_videos, max_comments)
         if df.empty:
-            st.error("수집된 댓글이 없어요. 검색어나 API 키를 확인해 주세요.")
+            st.warning("수집된 댓글이 없어요. (위 오류 메시지 또는 검색어/키/할당량을 확인해 주세요.)")
         else:
             start = df["comment_published_at"].min().strftime("%Y-%m-%d")
             end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
