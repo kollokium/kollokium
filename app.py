@@ -393,11 +393,13 @@ if run:
         if df.empty:
             st.error("수집된 댓글이 없습니다. 품목명·API 키·기간·조회수 조건을 확인해 주세요.")
         else:
-            start = df["comment_published_at"].min().strftime("%Y-%m-%d")
-            end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
-            with st.spinner("구글 검색량 추이 수집 중..."):
+            # 댓글 기간과 무관하게 검색량은 최근 1년치를 수집 (추세 비교 기준 확보)
+            trend_end = pd.Timestamp.now(tz="UTC")
+            trend_start = trend_end - pd.Timedelta(days=365)
+            start = trend_start.strftime("%Y-%m-%d")
+            end   = trend_end.strftime("%Y-%m-%d")
+            with st.spinner("구글 검색량 추이 수집 중... (최근 1년)"):
                 trend = get_search_trend(kw, start, end, serp_key)
-            merged = merge_files(df, trend)
 
             c1, c2, c3 = st.columns(3)
             c1.metric("수집 댓글", f"{len(df):,}")
