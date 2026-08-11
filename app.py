@@ -1,4 +1,4 @@
-# ===== app.py : 유행 데이터 수집 + 바이럴 동향 예측 (기간 선택 추가) =====
+# ===== app.py : 유행 데이터 수집 + 바이럴 동향 예측 (기간·조회수 필터 추가) =====
 # 필요 파일: app.py, train_data.csv (같은 폴더에 둘 것)
 # requirements: streamlit, pandas, numpy, scikit-learn, requests, google-api-python-client
 
@@ -162,8 +162,11 @@ STAGE_MSG = {
 # =====================================================================
 # [수집 파트]
 # =====================================================================
-def crawl_comments(keyword, api_key, max_videos=30, max_comments=100, period_days=None):
-    """period_days가 있으면 그 기간 내 영상만 검색하고, 댓글도 그 기간으로 거른다."""
+def crawl_comments(keyword, api_key, max_videos=100, max_comments=100,
+                   period_days=None, sort_by_views=False,
+                   top_by_views=None, min_views=0):
+    """period_days: 기간 필터 / sort_by_views: 조회수순 검색
+       top_by_views: 조회수 상위 N개 영상만 사용 / min_views: 최소 조회수"""
     yt = build("youtube", "v3", developerKey=api_key)
     published_after = None
     if period_days:
@@ -175,7 +178,8 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100, period_day
         try:
             params = dict(q=keyword, part="id", type="video",
                           maxResults=min(50, max_videos - len(ids)), pageToken=page,
-                          regionCode="KR", relevanceLanguage="ko")
+                          regionCode="KR", relevanceLanguage="ko",
+                          order="viewCount" if sort_by_views else "relevance")
             if published_after:
                 params["publishedAfter"] = published_after
             res = yt.search().list(**params).execute()
@@ -191,6 +195,7 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100, period_day
         if not page:
             break
 
+    # 영상 메타데이터
     details = {}
     for i in range(0, len(ids), 50):
         try:
@@ -204,6 +209,27 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100, period_day
                 "video_title": s["title"], "channel_title": s["channelTitle"],
                 "view_count": int(stt["viewCount"]) if "viewCount" in stt else None,
                 "video_published_at": s["publishedAt"]}
+
+    # --- 조회수 필터: 최소 조회수 미만 제외 + 상위 N개만 ---
+    if details:
+        meta_df = pd.DataFrame.from_dict(details, orient="index")
+        meta_df.index.name = "video_id"; meta_df = meta_df.reset_index()
+        meta_df["view_count"] = pd.to_numeric(meta_df["view_count"], errors="coerce").fillna(0)
+        before = len(meta_df)
+        if min_views > 0:
+            meta_df = meta_df[meta_df["view_count"] >= min_views]
+        meta_df = meta_df.sort_values("view_count", ascending=False)
+        if top_by_views:
+            meta_df = meta_df.head(top_by_views)
+        kept = set(meta_df["video_id"])
+        ids = [v for v in ids if v in kept]
+        details = {k: v for k, v in details.items() if k in kept}
+        if before != len(ids):
+            st.caption(f"영상 {before}개 중 조회수 기준으로 {len(ids)}개 선별")
+
+    if not ids:
+        st.warning("조회수 조건을 만족하는 영상이 없습니다. 최소 조회수를 낮춰보세요.")
+        return pd.DataFrame()
 
     records = []
     prog = st.progress(0.0, text="유튜브 댓글 수집 중...")
@@ -238,7 +264,6 @@ def crawl_comments(keyword, api_key, max_videos=30, max_comments=100, period_day
     df.drop_duplicates(subset=["video_id", "comment"], inplace=True)
     df["comment_published_at"] = pd.to_datetime(df["comment_published_at"], utc=True, errors="coerce")
 
-    # 댓글 작성일 기준 2차 필터 (API는 댓글 날짜로 직접 못 거름)
     if period_days:
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=period_days)
         df = df[df["comment_published_at"] >= cutoff]
@@ -324,13 +349,26 @@ with st.sidebar:
         yt_key = st.text_input("YouTube API 키", type="password")
     if not serp_key:
         serp_key = st.text_input("SerpApi 키", type="password")
+
+    st.subheader("① 기간")
     period_label = st.selectbox("수집 기간", list(PERIOD_OPTIONS.keys()), index=0)
     period_days, pred_ok = PERIOD_OPTIONS[period_label]
     if not pred_ok:
-        st.warning("이 기간은 너무 짧아 **예측이 부정확하거나 불가**합니다. "
+        st.warning("이 기간은 짧아 **예측이 부정확하거나 불가**합니다. "
                    "예측이 목적이면 '전체' 또는 '최근 1년' 이상을 쓰세요.")
-    max_videos = st.slider("영상 수", 10, 500, 100, step=10)
+
+    st.subheader("② 영상 선별")
+    max_videos = st.slider("검색할 영상 수", 10, 500, 300, step=10,
+                           help="넉넉히 모은 뒤 아래 조건으로 걸러냅니다.")
+    use_top = st.checkbox("조회수 상위 N개만 분석", value=True)
+    top_by_views = st.slider("상위 N개", 10, 300, 100, step=10) if use_top else None
+    min_views = st.number_input("최소 조회수 (미만 제외)", min_value=0, value=1000, step=500)
+    sort_by_views = st.checkbox("조회수순으로 검색", value=False,
+                                help="켜면 조회수 높은 영상 위주로 찾지만, 오래된 영상에 치우칠 수 있습니다.")
+
+    st.subheader("③ 댓글")
     max_comments = st.slider("영상당 댓글 수", 20, 10000, 100, step=10)
+
     st.divider()
     if model is None:
         st.error("train_data.csv 가 없어 예측을 쓸 수 없습니다. app.py와 같은 폴더에 두세요.")
@@ -349,10 +387,11 @@ if run:
         st.warning("품목을 입력하세요.")
     else:
         kw = keyword.strip()
-        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중... ({period_label}, 영상이 많으면 몇 분 걸립니다)"):
-            df = crawl_comments(kw, yt_key, max_videos, max_comments, period_days)
+        with st.spinner(f"'{kw}' 유튜브 댓글 수집 중... ({period_label}, 몇 분 걸릴 수 있습니다)"):
+            df = crawl_comments(kw, yt_key, max_videos, max_comments,
+                                period_days, sort_by_views, top_by_views, int(min_views))
         if df.empty:
-            st.error("수집된 댓글이 없습니다. 품목명·API 키·수집 기간을 확인해 주세요.")
+            st.error("수집된 댓글이 없습니다. 품목명·API 키·기간·조회수 조건을 확인해 주세요.")
         else:
             start = df["comment_published_at"].min().strftime("%Y-%m-%d")
             end   = df["comment_published_at"].max().strftime("%Y-%m-%d")
@@ -362,7 +401,7 @@ if run:
 
             c1, c2, c3 = st.columns(3)
             c1.metric("수집 댓글", f"{len(df):,}")
-            c2.metric("영상 수", f"{df['video_id'].nunique():,}")
+            c2.metric("분석 영상 수", f"{df['video_id'].nunique():,}")
             c3.metric("댓글 기간", f"{df['comment_published_at'].min().date()} ~ {df['comment_published_at'].max().date()}")
 
             # ============ 예측 ============
@@ -377,7 +416,7 @@ if run:
             else:
                 wk = build_weekly_features(merged, kw)
                 if wk.empty:
-                    st.warning("주간 데이터가 부족해 예측할 수 없습니다. 수집 기간을 늘리거나 영상 수를 늘려 보세요.")
+                    st.warning("주간 데이터가 부족해 예측할 수 없습니다. 기간이나 영상 수를 늘려 보세요.")
                 else:
                     last = wk.iloc[-1]
                     stage = judge_stage(last, recent_trend_of(wk))
