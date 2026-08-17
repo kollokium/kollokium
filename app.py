@@ -406,6 +406,7 @@ if run:
             c2.metric("분석 영상 수", f"{df['video_id'].nunique():,}")
             c3.metric("댓글 기간", f"{df['comment_published_at'].min().date()} ~ {df['comment_published_at'].max().date()}")
 
+            merged = merge_files(df, trend)
             # ============ 예측 ============
             st.subheader("🔮 바이럴 동향 예측")
             if not pred_ok:
