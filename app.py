@@ -1,14 +1,6 @@
 # ===== app.py : 유행 데이터 수집 + 바이럴 동향 예측 =====
 # 필요 파일: app.py, train_data.csv (같은 폴더에 둘 것)
 # requirements: streamlit, pandas, numpy, scipy, scikit-learn, requests, google-api-python-client
-#
-# [분석 방법] 댓글의 '내용(감성 사전)'이 아니라 '확산의 시간 구조'를 본다.
-#   - 반응 지연     : 영상 업로드 후 댓글이 붙기까지의 시간
-#   - 반응 효율     : 영상 1편당 댓글 수
-#   - 참여 채널 수  : 몇 개 채널이 이 품목을 다루는가
-#   - 신규 영상 수  : 그 주에 새로 올라온 영상 수
-#   - 댓글 집중도   : 소수 영상 쏠림 여부 (지니계수)
-#   - Bass 확산모형 : 혁신계수 p / 모방계수 q 추정
 
 import os
 import time
@@ -62,7 +54,6 @@ PERIOD_OPTIONS = {
     "최근 4주": (28, False, 365),
 }
 
-# 한 검색어로는 유튜브가 100개 언저리에서 끊기므로, 변형 검색어로 나눠 모은다
 QUERY_SUFFIXES = ["", " 먹방", " 리뷰", " 후기", " 맛집", " 유행", " 만들기",
                   " 브이로그", " asmr", " 추천", " 존맛", " 내돈내산"]
 
@@ -208,8 +199,7 @@ def interpret_bass(r2, qp):
 # [수집 파트]
 # =====================================================================
 def search_video_ids(yt, keyword, target, published_after, sort_by_views):
-    """변형 검색어를 순회하며 target개를 채운다.
-    (한 검색어로는 유튜브가 100개 근처에서 페이지를 끊음)"""
+    """변형 검색어를 순회하며 후보 영상 ID를 target개까지 모은다."""
     ids, seen = [], set()
     status = st.empty()
     for suf in QUERY_SUFFIXES:
@@ -236,22 +226,23 @@ def search_video_ids(yt, keyword, target, published_after, sort_by_views):
             page = res.get("nextPageToken")
             if not page:
                 break
-        status.caption(f"검색 중… '{q}' 까지 누적 {len(ids)}개")
+        status.caption(f"검색 중… '{q}' 까지 후보 {len(ids)}개")
     status.empty()
     return ids[:target]
 
 
 def crawl_comments(keyword, api_key, target_videos=100, max_comments=100,
                    period_days=None, sort_by_views=False, min_views=0):
-    """target_videos개를 최종 확보하는 것이 목표.
-    필터로 걸러질 것을 감안해 넉넉히 검색한 뒤 상위 target개를 남긴다."""
+    """댓글이 실제로 수집된 영상이 target_videos개가 될 때까지 진행한다.
+    댓글이 꺼졌거나 0개인 영상은 세지 않고 건너뛴다."""
     yt = build("youtube", "v3", developerKey=api_key)
     published_after = None
     if period_days:
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=period_days)
         published_after = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    search_target = min(target_videos * 3, 500)
+    # 댓글 없는 영상까지 감안해 후보를 넉넉히(4배) 확보
+    search_target = min(target_videos * 4, 500)
     ids = search_video_ids(yt, keyword, search_target, published_after, sort_by_views)
     if not ids:
         return pd.DataFrame()
@@ -270,28 +261,30 @@ def crawl_comments(keyword, api_key, target_videos=100, max_comments=100,
                 "view_count": int(stt["viewCount"]) if "viewCount" in stt else None,
                 "video_published_at": s["publishedAt"]}
 
+    # 최소 조회수 필터 (목표를 못 채울 정도면 완화) + 조회수 높은 순으로 시도
     if details:
         meta_df = pd.DataFrame.from_dict(details, orient="index")
         meta_df.index.name = "video_id"; meta_df = meta_df.reset_index()
         meta_df["view_count"] = pd.to_numeric(meta_df["view_count"], errors="coerce").fillna(0)
         found = len(meta_df)
         filtered = meta_df[meta_df["view_count"] >= min_views] if min_views > 0 else meta_df
-        # 조회수 조건으로 목표를 못 채우면 조건을 완화해 개수를 우선 확보
         if len(filtered) < target_videos:
             filtered = meta_df
-        filtered = filtered.sort_values("view_count", ascending=False).head(target_videos)
-        kept = set(filtered["video_id"])
-        ids = [v for v in ids if v in kept]
-        details = {k: v for k, v in details.items() if k in kept}
-        st.caption(f"검색 {found}개 → 상위 {len(ids)}개 선별 (목표 {target_videos}개)")
+        order = filtered.sort_values("view_count", ascending=False)["video_id"].tolist()
+        ids = order
+        st.caption(f"후보 {found}개 확보 → 댓글 있는 영상 {target_videos}개를 채울 때까지 수집합니다.")
 
     if not ids:
         return pd.DataFrame()
 
     records = []
+    used_videos, skipped = 0, 0
     prog = st.progress(0.0, text="유튜브 댓글 수집 중...")
-    for i, v in enumerate(ids, 1):
+    for v in ids:
+        if used_videos >= target_videos:
+            break
         page = None; got = 0
+        vid_records = []
         while got < max_comments:
             try:
                 res = yt.commentThreads().list(part="snippet", videoId=v,
@@ -301,7 +294,7 @@ def crawl_comments(keyword, api_key, target_videos=100, max_comments=100,
                 break
             for it in res.get("items", []):
                 c = it["snippet"]["topLevelComment"]["snippet"]
-                records.append({"video_id": v, "comment": c["textOriginal"],
+                vid_records.append({"video_id": v, "comment": c["textOriginal"],
                     "comment_published_at": c["publishedAt"],
                     "comment_like_count": c.get("likeCount", 0)})
                 got += 1
@@ -309,8 +302,16 @@ def crawl_comments(keyword, api_key, target_videos=100, max_comments=100,
             if not page:
                 break
             time.sleep(0.1)
-        prog.progress(i / max(1, len(ids)), text=f"유튜브 댓글 수집 중... ({i}/{len(ids)})")
+        if not vid_records:          # 댓글 없음 → 목표에 포함하지 않고 건너뜀
+            skipped += 1
+            continue
+        records.extend(vid_records)
+        used_videos += 1
+        prog.progress(min(used_videos / target_videos, 1.0),
+                      text=f"댓글 수집 중... ({used_videos}/{target_videos}개 영상, 건너뜀 {skipped})")
     prog.empty()
+    if skipped:
+        st.caption(f"댓글이 없거나 사용중지된 영상 {skipped}개는 건너뛰었습니다.")
 
     if not records:
         return pd.DataFrame()
@@ -416,10 +417,10 @@ with st.sidebar:
                    "확산 지표는 최소 10주 이상의 데이터가 필요합니다.")
 
     st.subheader("② 영상")
-    target_videos = st.slider("분석할 영상 수 (목표)", 10, 300, 100, step=10,
-                              help="이 개수를 채우기 위해 변형 검색어로 여러 번 검색합니다.")
+    target_videos = st.slider("분석할 영상 수 (댓글 있는 영상 기준)", 10, 300, 100, step=10,
+                              help="댓글이 없는 영상은 세지 않고 건너뜁니다.")
     min_views = st.number_input("최소 조회수 (미만 제외)", min_value=0, value=0, step=500,
-                                help="이 조건으로 목표 개수를 못 채우면 개수 확보를 우선합니다.")
+                                help="이 조건으로 목표를 못 채우면 개수 확보를 우선합니다.")
     sort_by_views = st.checkbox("조회수순으로 검색", value=False)
     if min_views > 0:
         st.caption("⚠️ 조회수 필터를 강하게 걸면 참여 채널 수·신규 영상 수가 실제보다 적게 잡혀 "
